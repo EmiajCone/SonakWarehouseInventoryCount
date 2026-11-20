@@ -1,0 +1,960 @@
+/*
+  WAREHOUSE COUNT — Apps Script backend
+  ======================================
+  One Web App endpoint handling every scan, break/resume ping, and rack
+  completion — no Google Cloud Console, no OAuth for counters, no cost.
+
+  INSTALL:
+  1. Create a new Google Sheet for this event (e.g. "Warehouse Count 2026").
+  2. Extensions → Apps Script. Delete the sample code, paste this whole file in.
+  3. Deploy → New deployment → type "Web app". Execute as: Me. Who has access: Anyone.
+  4. Deploy, authorize it (expected — it's your own script), copy the /exec URL.
+     (After ANY update that adds a permission, run authorizeOnce once in the editor,
+      then Deploy → Manage deployments → Edit → New version.)
+  5. Paste that URL into config.js as submitUrl.
+
+  This script creates five tabs automatically the first time it runs:
+    Counts         — every scan/manual entry (this is your raw count data)
+    Presence       — active/break/resumed pings per counter per rack
+    RackCompletion — each counter's individual "I'm done" confirmation
+    RackStatus     — a rack flips to "complete" here once EVERY counter who
+                     touched it has confirmed — and a 25%-coverage sample of remarks gets
+                     flagged for an independent audit recount right here too.
+    Concerns       — "🚩 Report a Concern" submissions from the counting app
+                     (unscannable item, damaged rack, etc.) and their
+                     resolution, when a manager marks them resolved on the
+                     Dashboard.
+
+  Your Catalogs, Rack list, and Current Balance are separate Sheets you manage
+  yourself (published as CSV) — this script never touches those, it only
+  writes the operational data above.
+*/
+
+// The audit sample is PER RACK: when a rack is marked complete, 25% of that
+// rack's item lines (distinct GTIN / article+color+size, rounded UP, at least 1)
+// are picked for an independent recount by a different person. The pick is made
+// by REMARK: random remarks are chosen until their items cover at least 25%.
+// Every completed rack gets an audit of its sample. The picked items are stored
+// on the rack's RackStatus row (AuditSample) so the phone knows what to recount.
+const AUDIT_SAMPLE_RATE = 0.25;
+
+
+// ---------------------------------------------------------------------------
+// FIREBASE MIRROR (real-time layer). Phones push scans / presence / completions
+// straight to Firebase; the Dashboard reads Firebase, so it moves instantly and
+// never waits on this script. The Sheet stays the permanent record. What only THIS
+// script can compute (rack status + audit sample, audit results, count window,
+// resets) is mirrored to Firebase right after it is written to the Sheet.
+// Leave FIREBASE_URL as "" to switch mirroring off (the Dashboard then just polls).
+// Use the same URL as firebaseUrl in config.js.
+// ---------------------------------------------------------------------------
+const FIREBASE_URL = "https://warehouse-count-9e07c-default-rtdb.firebaseio.com";
+// RUN THIS ONCE from the Apps Script editor (select authorizeOnce in the function
+// dropdown → Run → Review permissions → Allow). The Firebase mirror below makes web
+// requests, which is a NEW permission; until the owner allows it, the web app answers
+// with an HTML "authorization required" page instead of data and the Dashboard shows
+// "Unexpected token '<'". After allowing: Deploy → Manage deployments → Edit (pencil)
+// → Version: New version → Deploy.
+function authorizeOnce() {
+  UrlFetchApp.fetch((FIREBASE_URL || "https://www.google.com").replace(/\/$/, "") + (FIREBASE_URL ? "/live/ping.json?shallow=true" : ""), { muteHttpExceptions: true });
+  SpreadsheetApp.getActiveSpreadsheet().getName();
+  CacheService.getScriptCache().get("x");
+  PropertiesService.getScriptProperties().getProperty("x");
+  LockService.getScriptLock();
+  Logger.log("Authorized ✔ — now deploy a NEW VERSION.");
+}
+function fbKey_(s) { return String(s == null ? "" : s).replace(/[.#$\[\]\/]/g, "_"); }
+function fbRequest_(method, path, obj) {
+  if (!FIREBASE_URL) return;
+  try {
+    const opt = { method: method, muteHttpExceptions: true, contentType: "application/json" };
+    if (obj !== undefined) opt.payload = JSON.stringify(obj);
+    UrlFetchApp.fetch(FIREBASE_URL.replace(/\/$/, "") + "/live/" + path + ".json", opt);
+  } catch (err) { /* best effort — the Sheet write already succeeded and the Dashboard also reconciles from it */ }
+}
+// Copies one RackStatus row (by sheet row number) to Firebase.
+function mirrorStatusRow_(sheet, rowIdx) {
+  if (!FIREBASE_URL) return;
+  try {
+    const lastCol = sheet.getLastColumn();
+    const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    const vals = sheet.getRange(rowIdx, 1, 1, lastCol).getValues()[0];
+    const o = {};
+    header.forEach(function (h, i) {
+      let v = vals[i];
+      if (v instanceof Date) v = v.toISOString();
+      if (v === undefined || v === null) v = "";
+      if (h) o[String(h)] = v;
+    });
+    o._at = Date.now(); // lets the Dashboard tell "newer than my last Sheet read" from "already in it"
+    fbRequest_("put", "rackstatus/" + fbKey_(o.Brand) + "_" + fbKey_(o.Rack), o);
+  } catch (err) { /* best effort */ }
+}
+
+// ---------------------------------------------------------------------------
+// SPEED HELPERS
+//  • Section versions: every write to Presence / RackCompletion / RackStatus /
+//    Concerns bumps a tiny version tag in the script cache. A Dashboard that
+//    already holds the current version is told "unchanged" and NO sheet is read.
+//    If the cache forgets a tag, a new one is made — the Dashboard just does one
+//    extra full read, never a wrong one.
+//  • readRowsWhere_: reads ONE column to find matching rows, then only the rows'
+//    span — instead of pulling a whole big sheet into memory.
+// ---------------------------------------------------------------------------
+function getVer_(name) {
+  const cache = CacheService.getScriptCache();
+  let v = cache.get("ver_" + name);
+  if (!v) { v = "v" + Date.now() + "_" + Math.floor(Math.random() * 1e6); cache.put("ver_" + name, v, 21600); }
+  return v;
+}
+function bumpVer_() {
+  const cache = CacheService.getScriptCache();
+  const o = {};
+  for (let i = 0; i < arguments.length; i++) o["ver_" + arguments[i]] = "v" + Date.now() + "_" + Math.floor(Math.random() * 1e6);
+  cache.putAll(o, 21600);
+}
+function readRowsWhere_(sheet, colName, value) {
+  if (!sheet) return [];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const ci = header.indexOf(colName);
+  if (ci < 0) return [];
+  const col = sheet.getRange(2, ci + 1, lastRow - 1, 1).getValues();
+  const want = String(value);
+  let first = -1, last = -1;
+  for (let i = 0; i < col.length; i++) {
+    if (String(col[i][0]) === want) { if (first < 0) first = i; last = i; }
+  }
+  if (first < 0) return [];
+  const vals = sheet.getRange(first + 2, 1, last - first + 1, lastCol).getValues();
+  const out = [];
+  for (let k = 0; k < vals.length; k++) {
+    if (String(vals[k][ci]) !== want) continue;
+    const obj = {};
+    for (let c = 0; c < header.length; c++) obj[header[c]] = vals[k][c];
+    out.push(obj);
+  }
+  return out;
+}
+// Only some columns of a sheet (much cheaper than every column).
+function readColumns_(sheet, names) {
+  if (!sheet) return [];
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const cols = names.map(function (n) { return header.indexOf(n); });
+  const data = cols.map(function (ci) { return ci < 0 ? null : sheet.getRange(2, ci + 1, lastRow - 1, 1).getValues(); });
+  const out = [];
+  for (let i = 0; i < lastRow - 1; i++) {
+    const o = {};
+    names.forEach(function (n, j) { o[n] = data[j] ? data[j][i][0] : ""; });
+    out.push(o);
+  }
+  return out;
+}
+// Append-only sheet: everything, or only rows after the first `since` ones.
+function readAppendOnly_(sheet, since, epochOk) {
+  if (!sheet) return { rows: [], mode: "full", total: 0 };
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return { rows: [], mode: "full", total: 0 };
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  let from = 2, mode = "full";
+  if (epochOk && since > 0 && since <= lastRow - 1) { from = since + 2; mode = "delta"; }
+  const n = lastRow - from + 1;
+  const values = n > 0 ? sheet.getRange(from, 1, n, lastCol).getValues() : [];
+  const rows = values.map(function (row) { const o = {}; header.forEach(function (h, i) { o[h] = row[i]; }); return o; });
+  return { rows: rows, mode: mode, total: lastRow - 1 };
+}
+
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+    if (data.action === "scan") return handleScan(data);
+    if (data.action === "scanBatch") return handleScanBatch(data);
+    if (data.action === "presence") return handlePresence(data);
+    if (data.action === "complete") return handleComplete(data);
+    if (data.action === "concern") return handleConcern(data);
+    if (data.action === "resolveConcern") return handleResolveConcern(data);
+    if (data.action === "setCountWindow") return handleSetCountWindow(data);
+    if (data.action === "approveScan") return handleApproveScan(data);
+    if (data.action === "rejectScan") return handleRejectScan(data);
+    if (data.action === "approveScans") return handleApproveScan(data);
+    if (data.action === "rejectScans") return handleRejectScan(data);
+    if (data.action === "auditScan") return handleAuditScan(data);
+    if (data.action === "confirmAudit") return handleConfirmAudit(data);
+    if (data.action === "forceAuditFlag") return handleForceAuditFlag(data);
+    if (data.action === "resetAllData") return handleResetAllData(data);
+    return jsonResponse_({ ok: false, error: "Unknown action: " + data.action });
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: String(err) });
+  }
+}
+
+function doGet(e) {
+  // Returns a JSON snapshot for the Dashboard — reads live, no publish-to-web caching lag.
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const p = (e && e.parameter) || {};
+
+    // Lightweight mode for counter phones: ?concernId=XYZ returns just that
+    // concern's status (used to clear the "Managers notified" banner as soon
+    // as a manager resolves it), instead of the whole snapshot.
+    if (p.concernId) {
+      const sh = ss.getSheetByName("Concerns");
+      const rows = sh ? sheetToObjects_(sh) : [];
+      const row = rows.filter(function (r) { return r.ConcernID === p.concernId; })[0];
+      return jsonResponse_({ ok: true, concern: row ? { status: row.Status, resolvedBy: row.ResolvedBy } : null });
+    }
+
+    // Phone "Mark Rack Complete" check: only ONE counter session's rows are
+    // needed, so read just Counts and send back just that session.
+    if (p.only === "counts" && p.sessionId) {
+      const c = readCounts_(ss, {});
+      return jsonResponse_({ ok: true, counts: readRowsWhere_(ss.getSheetByName("Counts"), "SessionID", p.sessionId) });
+    }
+
+    // Audit reports (newest first). ?limit=N to cap how many.
+    if (p.only === "auditreports") {
+      return jsonResponse_({ ok: true, reports: readAuditReports_(parseInt(p.limit, 10) || 0) });
+    }
+
+    // Audit picker: only what the picker needs (flagged racks + who counted
+    // them), NOT the whole dashboard snapshot.
+    if (p.only === "audit") {
+      const seen = {}, people = [];
+      [ss.getSheetByName("Presence"), ss.getSheetByName("Counts")].forEach(function (sh) {
+        readColumns_(sh, ["Brand", "Rack", "Counter"]).forEach(function (r) {
+          const k = r.Brand + "|" + r.Rack + "|" + r.Counter;
+          if (seen[k]) return; seen[k] = true;
+          people.push({ Brand: r.Brand, Rack: r.Rack, Counter: r.Counter });
+        });
+      });
+      return jsonResponse_({ ok: true, status: sheetToObjects_(ss.getSheetByName("RackStatus")), presence: people, counts: [] });
+    }
+
+    // Audit prefetch: the auditor's phone downloads the ORIGINAL count for
+    // this one rack (one row per item, qty + whatever Remarks were attached
+    // when it was counted) BEFORE starting, instead of each recount scan
+    // waiting on a round trip to compare against the Sheet. Same accepted
+    // rows handleConfirmAudit itself compares against, so what the auditor
+    // sees on their phone always matches what the server will ultimately
+    // score them against.
+    if (p.only === "rackCounts" && p.brand && p.rack) {
+      return jsonResponse_({ ok: true, items: readRackCounts_(ss, p.brand, p.rack) });
+    }
+
+    // Counts is by far the biggest sheet. A Dashboard that already holds the
+    // first N rows can ask for only what was added since (?since=N&lastId=...&epoch=...).
+    // Anything that doesn't line up exactly (edited rows, wiped sheet, rows
+    // deleted by hand, older Dashboard) falls back to the full read below.
+    const snapTs = Date.now();
+    const c = readCounts_(ss, p);
+    // Versions are read BEFORE the data, so a write landing mid-read can only make
+    // the Dashboard fetch once more — never miss a change.
+    const vers = { presence: getVer_("presence"), completion: getVer_("completion"), status: getVer_("status"), concerns: getVer_("concerns") };
+    const epochOk = !!(p.epoch && p.epoch === c.epoch);
+    const out = {
+      ok: true,
+      counts: c.counts, countsMode: c.mode, countsTotal: c.total, lastScanId: c.lastScanId, epoch: c.epoch,
+      ver: vers, same: {}, serverNow: snapTs,
+      countWindow: (function(){ const pr = PropertiesService.getScriptProperties(); return { start: pr.getProperty("countWindowStart") || "", end: pr.getProperty("countWindowEnd") || "" }; })(),
+    };
+    ["presence", "completion"].forEach(function (k) {
+      if (p["v_" + k] && p["v_" + k] === vers[k]) { out.same[k] = true; return; }
+      const r = readAppendOnly_(ss.getSheetByName(k === "presence" ? "Presence" : "RackCompletion"), parseInt(p[k + "Since"], 10) || 0, epochOk);
+      out[k] = r.rows; out[k + "Mode"] = r.mode; out[k + "Total"] = r.total;
+    });
+    [["status", "RackStatus"], ["concerns", "Concerns"]].forEach(function (pair) {
+      if (p["v_" + pair[0]] && p["v_" + pair[0]] === vers[pair[0]]) { out.same[pair[0]] = true; return; }
+      out[pair[0]] = sheetToObjects_(ss.getSheetByName(pair[1]));
+    });
+    return jsonResponse_(out);
+  } catch (err) {
+    return jsonResponse_({ ok: false, error: String(err) });
+  }
+}
+
+// "Epoch" of the Counts sheet: changes whenever existing Counts rows are
+// EDITED in place (approve / reject / reset), which an incremental reader
+// can't see by just looking at new rows. Kept in the script cache; if the
+// cache ever forgets it, a fresh value is made — that only makes Dashboards
+// do one extra full read, never a wrong one.
+function getCountsEpoch_() {
+  const cache = CacheService.getScriptCache();
+  let ep = cache.get("counts_epoch");
+  if (!ep) { ep = "e" + Date.now() + "_" + Math.floor(Math.random() * 1e6); cache.put("counts_epoch", ep, 21600); }
+  return ep;
+}
+function bumpCountsEpoch_() {
+  CacheService.getScriptCache().put("counts_epoch", "e" + Date.now() + "_" + Math.floor(Math.random() * 1e6), 21600);
+}
+
+// Reads the Counts sheet as objects — everything, or (mode "delta") only the
+// rows after the first `since` ones, if the caller's copy is provably in sync.
+function readCounts_(ss, p) {
+  const epoch = getCountsEpoch_();
+  const sheet = ss.getSheetByName("Counts");
+  const empty = { counts: [], mode: "full", total: 0, lastScanId: "", epoch: epoch };
+  if (!sheet) return empty;
+  const lastRow = sheet.getLastRow();
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  if (lastRow < 2) return empty;
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  const idIdx = header.indexOf("ScanID");
+  const since = parseInt(p.since, 10);
+  let from = 2, mode = "full";
+  if (since > 0 && p.epoch && p.epoch === epoch && p.lastId && idIdx >= 0 && since <= lastRow - 1) {
+    const at = sheet.getRange(since + 1, idIdx + 1).getValue(); // the last row the caller already has
+    if (String(at) === String(p.lastId)) { from = since + 2; mode = "delta"; }
+  }
+  const n = lastRow - from + 1;
+  const values = n > 0 ? sheet.getRange(from, 1, n, lastCol).getValues() : [];
+  const counts = values.map(function (row) {
+    const obj = {};
+    header.forEach(function (h, i) { obj[h] = row[i]; });
+    return obj;
+  });
+  const lastScanId = counts.length ? String(counts[counts.length - 1].ScanID || "") : (mode === "delta" ? String(p.lastId) : "");
+  return { counts: counts, mode: mode, total: lastRow - 1, lastScanId: lastScanId, epoch: epoch };
+}
+
+// Reads the count window set from the Dashboard (Settings → Count Window).
+// Returns {start, end} as Date objects, or nulls if not configured — an
+// unconfigured window means "always open", matching current behavior for
+// anyone who hasn't set one up yet.
+function getCountWindow_() {
+  const props = PropertiesService.getScriptProperties();
+  const start = props.getProperty("countWindowStart");
+  const end = props.getProperty("countWindowEnd");
+  return { start: start ? new Date(start) : null, end: end ? new Date(end) : null };
+}
+
+function isWithinCountWindow_(now) {
+  const w = getCountWindow_();
+  if (!w.start || !w.end) return true; // no window configured — always accept, same as before this feature existed
+  return now >= w.start && now <= w.end;
+}
+
+// ---------------------------------------------------------------------------
+// SCAN WRITES. One request can carry many rows (action "scanBatch"); the old
+// single-row action "scan" runs through exactly the same code, so older phones
+// keep working. For a whole request the script takes the lock ONCE, reads the
+// sheet header ONCE, does ONE duplicate check and writes ALL new rows in ONE
+// call — instead of doing all of that per row while every other phone queues.
+// ---------------------------------------------------------------------------
+const COUNTS_HEADERS_ = ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "Method", "GTIN", "Article", "Description", "Color", "Size", "Qty", "ScanID", "Status"];
+const MAX_BATCH_ROWS_ = 200;
+
+function handleScan(d) {
+  return handleScanRows_([d], true);
+}
+function handleScanBatch(d) {
+  const rows = Array.isArray(d.rows) ? d.rows : [];
+  if (!rows.length) return jsonResponse_({ ok: false, error: "No rows given" });
+  if (rows.length > MAX_BATCH_ROWS_) return jsonResponse_({ ok: false, error: "Too many rows in one batch (max " + MAX_BATCH_ROWS_ + ")" });
+  return handleScanRows_(rows, false);
+}
+function handleScanRows_(rows, single) {
+  const lock = LockService.getScriptLock(); // two copies of the same scan must not both pass the duplicate check
+  lock.waitLock(25000);
+  try {
+    const results = writeScansLocked_(rows);
+    return jsonResponse_(single ? results[0] : { ok: true, results: results });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// The phone re-sends a scan whenever it didn't get a clear "saved" answer
+// (weak signal, Apps Script's redirect hiccups, the offline queue) — but the
+// first attempt often DID land, so a ScanID already in the sheet (or the
+// recent-ScanID cache) is answered "duplicate" and NOT written again.
+//   • first-time rows: checked against the cache + the most recent 3000 rows
+//   • rows flagged retry (e.g. from the offline queue hours later): checked
+//     against the WHOLE ScanID column, so a late retry can never duplicate.
+// Returns one result per input row, in order.
+function writeScansLocked_(rows) {
+  const sheet = getOrCreateSheet_("Counts", COUNTS_HEADERS_);
+  const now = new Date();
+  const win = getCountWindow_(); // read once for the whole request
+  const cache = CacheService.getScriptCache();
+
+  const ids = rows.map(function (r) { return r && r.scanId ? String(r.scanId) : ""; });
+  const cacheKeys = ids.filter(Boolean).map(function (id) { return "scan_" + id; });
+  const cached = cacheKeys.length ? cache.getAll(cacheKeys) : {};
+
+  // One header read serves the ScanID column AND the RackBrand column (added
+  // automatically on older Counts sheets, exactly as before).
+  const lastRow = sheet.getLastRow();
+  const header = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  let rackBrandCol = header.indexOf("RackBrand") + 1;
+  if (rackBrandCol < 1) { rackBrandCol = header.length + 1; sheet.getRange(1, rackBrandCol).setValue("RackBrand"); header.push("RackBrand"); }
+  // Remark = the optional note the counter attached to the batch this scan
+  // was submitted in (e.g. "Box 4 of 6") — retained on the row itself so an
+  // auditor can later see exactly where/how the original count captured
+  // this item (see readRackCounts_, used by the audit prefetch).
+  let remarkCol = header.indexOf("Remark") + 1;
+  if (remarkCol < 1) { remarkCol = header.length + 1; sheet.getRange(1, remarkCol).setValue("Remark"); header.push("Remark"); }
+  const idCol = header.indexOf("ScanID") + 1;
+
+  // Only touch the sheet for the duplicate check if the cache didn't already settle every row.
+  let known = null;
+  const unsettled = ids.some(function (id) { return id && !cached["scan_" + id]; });
+  if (unsettled && idCol > 0 && lastRow >= 2) {
+    const deep = rows.some(function (r, i) { return ids[i] && r && r.retry && !cached["scan_" + ids[i]]; });
+    const n = deep ? lastRow - 1 : Math.min(lastRow - 1, 3000);
+    known = {};
+    sheet.getRange(lastRow - n + 1, idCol, n, 1).getValues().forEach(function (v) { known[String(v[0])] = true; });
+  }
+
+  const width = Math.max(COUNTS_HEADERS_.length, rackBrandCol, remarkCol);
+  const out = [], results = [], newIds = {}, seen = {};
+  rows.forEach(function (d, i) {
+    d = d || {};
+    const id = ids[i];
+    if (id && (cached["scan_" + id] || (known && known[id]) || seen[id])) {
+      results.push({ ok: true, duplicate: true, pending: false });
+      return;
+    }
+    if (id) { seen[id] = true; newIds["scan_" + id] = "1"; }
+    // Judge the count window against when the item was actually SCANNED (the
+    // phone's own timestamp), not when it reached the server — a scan taken
+    // outside the window while offline must not sneak in as "accepted" just
+    // because it synced later. The phone's clock is only trusted if it's a
+    // valid date that isn't in the future; otherwise use the server's time.
+    let scannedAt = d.ts ? new Date(d.ts) : now;
+    if (isNaN(scannedAt.getTime()) || scannedAt.getTime() > now.getTime() + 5 * 60 * 1000) scannedAt = now;
+    // Outside the window the scan is still SAVED (nothing is lost) but held as
+    // "pending" until a manager approves it on the Dashboard.
+    const accepted = !win.start || !win.end || (scannedAt >= win.start && scannedAt <= win.end);
+    // RackBrand = brand of the RACK the counter was standing at (can differ from
+    // Brand, the item's own brand, when an item of one brand is scanned on another's rack).
+    const row = [scannedAt, d.brand || "", d.rack || "", d.counter || "", d.deviceId || "", d.sessionId || "", d.method || "", d.gtin || "", d.article || "", d.desc || "", d.color || "", d.size || "", d.qty || 0, d.scanId || "", accepted ? "accepted" : "pending"];
+    while (row.length < width) row.push("");
+    row[rackBrandCol - 1] = d.rackBrand || d.brand || "";
+    row[remarkCol - 1] = d.remark || "";
+    out.push(row);
+    results.push({ ok: true, pending: !accepted });
+  });
+
+  if (out.length) {
+    const startRow = lastRow + 1; // same place appendRow would have used
+    const needRows = startRow + out.length - 1;
+    if (needRows > sheet.getMaxRows()) sheet.insertRowsAfter(sheet.getMaxRows(), needRows - sheet.getMaxRows());
+    sheet.getRange(startRow, 1, out.length, width).setValues(out);
+    cache.putAll(newIds, 21600); // remember for 6h
+  }
+  return results;
+}
+
+// A manager setting or clearing the count window from the Dashboard. Pass
+// empty strings for start/end to clear it (reopens the window entirely).
+function handleSetCountWindow(d) {
+  const props = PropertiesService.getScriptProperties();
+  if (d.start) props.setProperty("countWindowStart", d.start); else props.deleteProperty("countWindowStart");
+  if (d.end) props.setProperty("countWindowEnd", d.end); else props.deleteProperty("countWindowEnd");
+  fbRequest_("put", "window", { start: d.start || "", end: d.end || "", _at: Date.now() });
+  return jsonResponse_({ ok: true });
+}
+
+// A manager approving or rejecting a pending (outside-window) scan from the
+// Dashboard. Rejected scans are marked "rejected", not deleted — kept for
+// the audit trail, same principle as Concerns never being deleted.
+// One or many scans in a single call. Reads only the ScanID + Status columns
+// and writes the Status column back once — much faster than scanning the whole
+// Counts sheet per scan — and runs under the same lock as new scans so nothing
+// can be appended or changed in between.
+function reviewScansLocked_(ids, newStatus) {
+  const sheet = getOrCreateSheet_("Counts", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "Method", "GTIN", "Article", "Description", "Color", "Size", "Qty", "ScanID", "Status"]);
+  const lastRow = sheet.getLastRow();
+  const header = sheet.getRange(1, 1, 1, Math.max(sheet.getLastColumn(), 1)).getValues()[0];
+  const idCol = header.indexOf("ScanID") + 1, statusCol = header.indexOf("Status") + 1;
+  if (idCol < 1 || statusCol < 1) return jsonResponse_({ ok: false, error: "Counts sheet is missing ScanID/Status columns — redeploy this script as a new version if it's an older sheet." });
+  if (lastRow < 2) return jsonResponse_({ ok: false, error: "Scan not found (bad ID, or it predates the approval feature)" });
+  const n = lastRow - 1;
+  const idVals = sheet.getRange(2, idCol, n, 1).getValues();
+  const statusRange = sheet.getRange(2, statusCol, n, 1);
+  const statusVals = statusRange.getValues();
+  const want = {};
+  ids.forEach((id) => { want[String(id)] = true; });
+  let updated = 0;
+  for (let i = 0; i < n; i++) {
+    const id = String(idVals[i][0]);
+    if (want[id]) { statusVals[i][0] = newStatus; updated++; delete want[id]; }
+  }
+  if (updated > 0) { statusRange.setValues(statusVals); bumpCountsEpoch_(); } // rows edited in place: Dashboards must re-read everything once
+  const missing = Object.keys(want).length;
+  if (updated === 0) return jsonResponse_({ ok: false, error: "Scan not found (bad ID, or it predates the approval feature)" });
+  return jsonResponse_({ ok: true, updated: updated, missing: missing });
+}
+function handleReviewScans_(d, newStatus) {
+  const ids = Array.isArray(d.scanIds) ? d.scanIds : (d.scanId ? [d.scanId] : []);
+  if (!ids.length) return jsonResponse_({ ok: false, error: "No scan IDs given" });
+  const lock = LockService.getScriptLock();
+  lock.waitLock(25000);
+  try { return reviewScansLocked_(ids, newStatus); } finally { lock.releaseLock(); }
+}
+function handleApproveScan(d) { return handleReviewScans_(d, "accepted"); }
+function handleRejectScan(d) { return handleReviewScans_(d, "rejected"); }
+
+function handlePresence(d) {
+  const sheet = getOrCreateSheet_("Presence", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "Status"]);
+  sheet.appendRow([new Date(), d.brand || "", d.rack || "", d.counter || "", d.deviceId || "", d.sessionId || "", d.status || ""]);
+  bumpVer_("presence");
+  return jsonResponse_({ ok: true });
+}
+
+// Adds a column to a sheet if it doesn't already have one by that name —
+// safe to call on sheets created by an older version of this script, so a
+// feature added later never silently fails to write just because the
+// sheet's header predates it. Returns the column's 1-based index.
+function ensureColumn_(sheet, name) {
+  const lastCol = Math.max(sheet.getLastColumn(), 1);
+  const header = sheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  let idx = header.indexOf(name);
+  if (idx === -1) {
+    idx = header.length;
+    sheet.getRange(1, idx + 1).setValue(name);
+  }
+  return idx + 1; // 1-based, for getRange
+}
+
+// An auditor's recount scan — kept entirely separate from the main Counts
+// sheet so it never inflates the official tally; it's a verification
+// exercise, compared against the original count on confirmAudit below.
+function handleAuditScan(d) {
+  const sheet = getOrCreateSheet_("AuditCounts", ["Timestamp", "Brand", "Rack", "Auditor", "DeviceID", "AuditSessionID", "GTIN", "Article", "Description", "Color", "Size", "Qty"]);
+  sheet.appendRow([new Date(), d.brand || "", d.rack || "", d.auditor || "", d.deviceId || "", d.auditSessionId || "", d.gtin || "", d.article || "", d.desc || "", d.color || "", d.size || "", d.qty || 0]);
+  return jsonResponse_({ ok: true });
+}
+
+// An auditor confirming their recount is done — computes the audited total
+// server-side (from AuditCounts rows for this exact audit session, not a
+// client-supplied number), compares against the original count, and
+// records the result directly on the rack's RackStatus row so the
+// Dashboard can show it immediately.
+// A manager deliberately flagging an already-completed rack for audit from
+// the Dashboard — independent of the random 25% sample, e.g. to test the
+// flow, or to audit a specific rack with a history of discrepancies.
+// Wipes ALL count data — every row in every sheet this script writes to,
+// headers kept. Meant for clearing out test data before going live, not
+// for routine use — there's no way to tell "test" rows from real ones
+// apart automatically, so this is all-or-nothing by design. Requires a
+// literal confirm phrase from the caller as a guard against an accidental
+// call (the Dashboard button enforces this too, but it's checked here as
+// well in case this endpoint is ever called directly).
+function handleResetAllData(d) {
+  if (d.confirm !== "RESET") {
+    return jsonResponse_({ ok: false, error: 'Refused: confirm must be exactly "RESET"' });
+  }
+  const sheetNames = ["Counts", "Presence", "RackCompletion", "RackStatus", "Concerns", "AuditCounts", "AuditReports"];
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  sheetNames.forEach((name) => {
+    const sheet = ss.getSheetByName(name);
+    if (sheet && sheet.getLastRow() > 1) {
+      sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).clearContent();
+    }
+  });
+  bumpCountsEpoch_();
+  bumpVer_("presence", "completion", "status", "concerns");
+  // The Firebase live layer is cleared by the Dashboard itself, in parallel and with time limits. Doing it
+  // here (eight requests in a row, one of them a huge node) is what used to make Reset hang.
+  return jsonResponse_({ ok: true });
+}
+
+function handleForceAuditFlag(d) {
+  const statusSheet = getOrCreateSheet_("RackStatus", ["Timestamp", "Brand", "Rack", "Status", "AuditFlag"]);
+  const colConfirmed = ensureColumn_(statusSheet, "AuditConfirmed");
+  const values = statusSheet.getDataRange().getValues();
+  const header = values[0];
+  const brandIdx = header.indexOf("Brand"), rackIdx = header.indexOf("Rack"), flagIdx = header.indexOf("AuditFlag");
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][brandIdx] === d.brand && values[i][rackIdx] === d.rack) {
+      statusSheet.getRange(i + 1, flagIdx + 1).setValue("yes");
+      // A hand-picked audit shouldn't use up the random sample's quota — unless
+      // this rack was already randomly selected, in which case leave it counted.
+      if (values[i][header.indexOf("AuditSource")] !== "random") {
+        statusSheet.getRange(i + 1, ensureColumn_(statusSheet, "AuditSource")).setValue("manual");
+      }
+      statusSheet.getRange(i + 1, colConfirmed).setValue(""); // clear any previous confirmation, so it needs a fresh recount
+      bumpVer_("status");
+      mirrorStatusRow_(statusSheet, i + 1);
+      return jsonResponse_({ ok: true });
+    }
+  }
+  return jsonResponse_({ ok: false, error: "This rack hasn't been marked complete yet — it needs a RackStatus row first." });
+}
+
+function handleConfirmAudit(d) {
+  const auditSheet = getOrCreateSheet_("AuditCounts", ["Timestamp", "Brand", "Rack", "Auditor", "DeviceID", "AuditSessionID", "GTIN", "Article", "Description", "Color", "Size", "Qty"]);
+  const auditRows = readRowsWhere_(auditSheet, "AuditSessionID", d.auditSessionId);
+
+  const countsSheet = getOrCreateSheet_("Counts", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "Method", "GTIN", "Article", "Description", "Color", "Size", "Qty", "ScanID", "Status"]);
+  const originalRows = readRowsWhere_(countsSheet, "Rack", d.rack)
+    .filter((r) => r.Rack === d.rack && (r.RackBrand || r.Brand) === d.brand && r.Status !== "pending" && r.Status !== "rejected");
+
+  const statusSheet = getOrCreateSheet_("RackStatus", ["Timestamp", "Brand", "Rack", "Status", "AuditFlag"]);
+  const colConfirmed = ensureColumn_(statusSheet, "AuditConfirmed");
+  const colBy = ensureColumn_(statusSheet, "AuditConfirmedBy");
+  const colAt = ensureColumn_(statusSheet, "AuditConfirmedAt");
+  const colAuditedQty = ensureColumn_(statusSheet, "AuditedQty");
+  const colOriginalQty = ensureColumn_(statusSheet, "OriginalQty");
+  const colVariance = ensureColumn_(statusSheet, "AuditVariance");
+
+  const values = statusSheet.getDataRange().getValues();
+  const header = values[0];
+  const brandIdx = header.indexOf("Brand"), rackIdx = header.indexOf("Rack");
+  let rowIdx = -1;
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][brandIdx] === d.brand && values[i][rackIdx] === d.rack) { rowIdx = i + 1; break; }
+  }
+  if (rowIdx === -1) return jsonResponse_({ ok: false, error: "This rack has no RackStatus row yet (it may not have been marked complete by its original counter)." });
+
+  // Compare ONLY the sampled items (if this rack has a stored sample; a
+  // manually forced audit has none and covers the whole rack).
+  const colSample = ensureColumn_(statusSheet, "AuditSample");
+  const colDiffs = ensureColumn_(statusSheet, "AuditItemDiffs");
+  let sampleKeys = null;
+  try {
+    const raw = statusSheet.getRange(rowIdx, colSample).getValue();
+    if (raw) sampleKeys = JSON.parse(raw).map((x) => x.key);
+  } catch (err) { sampleKeys = null; }
+  const inSample = (r) => !sampleKeys || sampleKeys.indexOf(itemKey_(r)) !== -1;
+  const orig = {}, aud = {}, names = {};
+  originalRows.filter(inSample).forEach((r) => { const k = itemKey_(r); orig[k] = (orig[k] || 0) + (parseFloat(r.Qty) || 0); names[k] = r.Description || r.Article || k; });
+  auditRows.filter(inSample).forEach((r) => { const k = itemKey_(r); aud[k] = (aud[k] || 0) + (parseFloat(r.Qty) || 0); names[k] = names[k] || r.Description || r.Article || k; });
+  const keys = sampleKeys ? sampleKeys.slice() : Object.keys(orig).concat(Object.keys(aud).filter((k) => !(k in orig)));
+  const diffs = [];
+  let originalQty = 0, auditedQty = 0;
+  keys.forEach((k) => {
+    const o = orig[k] || 0, a = aud[k] || 0;
+    originalQty += o; auditedQty += a;
+    if (o !== a) diffs.push({ item: names[k] || k, original: o, audited: a });
+  });
+  const variance = auditedQty - originalQty;
+
+  // ---- DETAILED REPORT (kept permanently in the AuditReports sheet + mirrored live to Firebase) ----
+  const meta = {}, boxQty = {};
+  originalRows.filter(inSample).forEach((r) => {
+    const k = itemKey_(r);
+    meta[k] = meta[k] || { gtin: String(r.GTIN || ""), article: String(r.Article || ""), desc: String(r.Description || ""), color: String(r.Color || ""), size: String(r.Size || "") };
+    const rm = String(r.Remark || "").trim() || "(no remark)";
+    boxQty[k] = boxQty[k] || {};
+    boxQty[k][rm] = (boxQty[k][rm] || 0) + (parseFloat(r.Qty) || 0);
+  });
+  auditRows.filter(inSample).forEach((r) => {
+    const k = itemKey_(r);
+    meta[k] = meta[k] || { gtin: String(r.GTIN || ""), article: String(r.Article || ""), desc: String(r.Description || ""), color: String(r.Color || ""), size: String(r.Size || "") };
+  });
+  const items = keys.map((k) => {
+    const o = orig[k] || 0, a = aud[k] || 0, m = meta[k] || { gtin: "", article: "", desc: names[k] || k, color: "", size: "" };
+    const boxes = Object.keys(boxQty[k] || {}).filter((b) => boxQty[k][b] !== 0).map((b) => ({ remark: b, qty: boxQty[k][b] }));
+    return { key: k, gtin: m.gtin, article: m.article, desc: m.desc, color: m.color, size: m.size, boxes: boxes, original: o, audited: a, variance: a - o,
+      result: o === a ? "match" : (a === 0 ? "not found" : (a < o ? "short" : "over")) };
+  });
+  items.sort((x, y) => (Math.abs(y.variance) - Math.abs(x.variance)) || String(x.desc).localeCompare(String(y.desc)));
+  const sampleInfoCell = statusSheet.getRange(rowIdx, ensureColumn_(statusSheet, "AuditSampleInfo")).getValue();
+  const nowIso = new Date().toISOString();
+  const report = { sessionId: String(d.auditSessionId || ""), brand: d.brand, rack: d.rack, auditor: d.auditor || "", at: nowIso,
+    sampleInfo: String(sampleInfoCell || (sampleKeys ? "" : "Whole rack (manually flagged)")),
+    originalQty: originalQty, auditedQty: auditedQty, variance: variance, itemsChecked: keys.length, itemsWithDiff: diffs.length, items: items };
+  try { saveAuditReport_(report); } catch (err) { /* the confirmation itself must not fail because of the report */ }
+
+  statusSheet.getRange(rowIdx, colDiffs).setValue(diffs.length ? JSON.stringify(diffs) : "");
+  statusSheet.getRange(rowIdx, colConfirmed).setValue("yes");
+  statusSheet.getRange(rowIdx, colBy).setValue(d.auditor || "");
+  statusSheet.getRange(rowIdx, colAt).setValue(new Date());
+  statusSheet.getRange(rowIdx, colAuditedQty).setValue(auditedQty);
+  statusSheet.getRange(rowIdx, colOriginalQty).setValue(originalQty);
+  statusSheet.getRange(rowIdx, colVariance).setValue(variance);
+  bumpVer_("status");
+  mirrorStatusRow_(statusSheet, rowIdx);
+
+  return jsonResponse_({ ok: true, auditedQty, originalQty, variance, itemsChecked: keys.length, itemsWithDiff: diffs.length, report: report });
+}
+
+// ---------------------------------------------------------------------------
+// AUDIT REPORTS — one row per item per audit, kept forever (until a full reset).
+// ---------------------------------------------------------------------------
+const AUDIT_REPORT_HEADERS_ = ["Timestamp", "Brand", "Rack", "Auditor", "AuditSessionID", "SampleInfo", "Boxes", "GTIN", "Article", "Description", "Color", "Size", "OriginalQty", "AuditQty", "Variance", "Result"];
+function saveAuditReport_(report) {
+  const sheet = getOrCreateSheet_("AuditReports", AUDIT_REPORT_HEADERS_);
+  // a retried confirmation must not write the same report twice
+  if (report.sessionId && readRowsWhere_(sheet, "AuditSessionID", report.sessionId).length) return;
+  const at = new Date(report.at);
+  const rows = report.items.map(function (it, i) {
+    return [at, report.brand, report.rack, report.auditor, report.sessionId, i === 0 ? report.sampleInfo : "",
+      it.boxes.map(function (b) { return b.remark + ": " + b.qty; }).join(" | "),
+      it.gtin, it.article, it.desc, it.color, it.size, it.original, it.audited, it.variance, it.result];
+  });
+  if (rows.length) sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, AUDIT_REPORT_HEADERS_.length).setValues(rows);
+  fbRequest_("put", "auditreport/" + fbKey_(report.brand) + "_" + fbKey_(report.rack) + "_" + fbKey_(report.sessionId), report);
+}
+// Rebuilds the reports (newest first) from the AuditReports sheet.
+function readAuditReports_(limit) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("AuditReports");
+  if (!sheet) return [];
+  const bySession = {}, order = [];
+  sheetToObjects_(sheet).forEach(function (r) {
+    const sid = String(r.AuditSessionID);
+    if (!bySession[sid]) {
+      bySession[sid] = { sessionId: sid, brand: r.Brand, rack: r.Rack, auditor: r.Auditor, at: r.Timestamp instanceof Date ? r.Timestamp.toISOString() : String(r.Timestamp),
+        sampleInfo: String(r.SampleInfo || ""), originalQty: 0, auditedQty: 0, variance: 0, itemsChecked: 0, itemsWithDiff: 0, items: [] };
+      order.push(sid);
+    }
+    const rep = bySession[sid];
+    if (r.SampleInfo && !rep.sampleInfo) rep.sampleInfo = String(r.SampleInfo);
+    const boxes = String(r.Boxes || "").split(" | ").filter(String).map(function (b) { const i = b.lastIndexOf(": "); return { remark: i < 0 ? b : b.slice(0, i), qty: i < 0 ? 0 : parseFloat(b.slice(i + 2)) || 0 }; });
+    const o = parseFloat(r.OriginalQty) || 0, a = parseFloat(r.AuditQty) || 0;
+    rep.items.push({ key: String(r.GTIN || [r.Article, r.Color, r.Size].join("|")), gtin: String(r.GTIN || ""), article: String(r.Article || ""), desc: String(r.Description || ""), color: String(r.Color || ""), size: String(r.Size || ""),
+      boxes: boxes, original: o, audited: a, variance: a - o, result: String(r.Result || "") });
+    rep.originalQty += o; rep.auditedQty += a; rep.itemsChecked++;
+    if (o !== a) rep.itemsWithDiff++;
+    rep.variance = rep.auditedQty - rep.originalQty;
+  });
+  const list = order.map(function (sid) { return bySession[sid]; });
+  list.sort(function (x, y) { return String(y.at).localeCompare(String(x.at)); });
+  return limit > 0 ? list.slice(0, limit) : list;
+}
+
+function handleComplete(d) {
+  // Two counters finishing the same rack at the same moment must not BOTH
+  // finalize it (that would write two RackStatus rows and roll the audit
+  // sample twice). A separate document lock is used, so scans — which use the
+  // script lock — are never held up behind a rack completion.
+  const lock = LockService.getDocumentLock() || LockService.getScriptLock();
+  lock.waitLock(25000);
+  try {
+    const sheet = getOrCreateSheet_("RackCompletion", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "TalliedQty"]);
+    sheet.appendRow([new Date(), d.brand || "", d.rack || "", d.counter || "", d.deviceId || "", d.sessionId || "", d.talliedQty || 0]);
+
+    const result = checkAndFinalizeRack_(d.brand, d.rack, Number(d.totalRacks) || 0);
+    bumpVer_("completion", "status");
+    return jsonResponse_({ ok: true, rackComplete: result.complete, auditFlagged: result.audit });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// A counter flagging a concern (unscannable item, damaged rack, etc.) so it
+// shows up on the Dashboard right away — counting continues in parallel,
+// this is just an attention signal, not a blocker.
+function handleConcern(d) {
+  const sheet = getOrCreateSheet_("Concerns", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "ConcernID", "Reason", "Note", "Status", "ResolvedAt", "ResolvedBy"]);
+  sheet.appendRow([new Date(), d.brand || "", d.rack || "", d.counter || "", d.deviceId || "", d.sessionId || "", d.concernId || "", d.reason || "", d.note || "", "open", "", ""]);
+  bumpVer_("concerns");
+  return jsonResponse_({ ok: true });
+}
+
+// A manager marking a concern resolved from the Dashboard. Resolver name is
+// required — this is enforced on the Dashboard's modal, and defensively
+// here too in case this endpoint is ever called some other way.
+function handleResolveConcern(d) {
+  if (!d.resolvedBy || !String(d.resolvedBy).trim()) {
+    return jsonResponse_({ ok: false, error: "resolvedBy is required" });
+  }
+  const sheet = getOrCreateSheet_("Concerns", ["Timestamp", "Brand", "Rack", "Counter", "DeviceID", "SessionID", "ConcernID", "Reason", "Note", "Status", "ResolvedAt", "ResolvedBy", "ResolutionRemarks"]);
+  const values = sheet.getDataRange().getValues();
+  const header = values[0];
+  const idIdx = header.indexOf("ConcernID");
+  const statusIdx = header.indexOf("Status");
+  const resolvedAtIdx = header.indexOf("ResolvedAt");
+  const resolvedByIdx = header.indexOf("ResolvedBy");
+  const remarksIdx = header.indexOf("ResolutionRemarks");
+  for (let i = 1; i < values.length; i++) {
+    if (values[i][idIdx] === d.concernId) {
+      sheet.getRange(i + 1, statusIdx + 1).setValue("resolved");
+      sheet.getRange(i + 1, resolvedAtIdx + 1).setValue(new Date());
+      sheet.getRange(i + 1, resolvedByIdx + 1).setValue(d.resolvedBy);
+      if (remarksIdx >= 0) sheet.getRange(i + 1, remarksIdx + 1).setValue(d.remarks || "");
+      bumpVer_("concerns");
+      return jsonResponse_({ ok: true });
+    }
+  }
+  return jsonResponse_({ ok: false, error: "Concern not found (already resolved elsewhere, or bad ID)" });
+}
+
+// Checks whether every counter who ever touched this brand+rack has now
+// confirmed complete. If so (and it hasn't already been finalized), marks
+// the rack complete in RackStatus and rolls the 25% audit sample.
+function checkAndFinalizeRack_(brand, rack, totalRacks) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Already finalized? Don't re-roll the audit sample on a second confirm.
+  const statusRows = sheetToObjects_(ss.getSheetByName("RackStatus"));
+  const already = statusRows.some((r) => r.Brand === brand && r.Rack === rack);
+  if (already) return { complete: true, audit: statusRows.some((r) => r.Brand === brand && r.Rack === rack && r.AuditFlag === "yes") };
+
+  const engaged = new Set();
+  readRowsWhere_(ss.getSheetByName("Presence"), "Rack", rack).forEach((r) => {
+    if (r.Brand === brand && r.Rack === rack) engaged.add(r.Counter);
+  });
+  const countsRows = readRowsWhere_(ss.getSheetByName("Counts"), "Rack", rack); // only this rack's rows, reused below
+  countsRows.forEach((r) => {
+    if (r.Brand === brand && r.Rack === rack) engaged.add(r.Counter);
+  });
+
+  const confirmed = new Set();
+  readRowsWhere_(ss.getSheetByName("RackCompletion"), "Rack", rack).forEach((r) => {
+    if (r.Brand === brand && r.Rack === rack) confirmed.add(r.Counter);
+  });
+
+  const allConfirmed = engaged.size > 0 && [...engaged].every((c) => confirmed.has(c));
+  if (!allConfirmed) return { complete: false, audit: false };
+
+  const sample = pickAuditSample_(ss, brand, rack, countsRows);
+  const auditFlag = sample.length > 0;
+  const sheet = getOrCreateSheet_("RackStatus", ["Timestamp", "Brand", "Rack", "Status", "AuditFlag"]);
+  sheet.appendRow([new Date(), brand, rack, "complete", auditFlag ? "yes" : "no"]);
+  if (auditFlag) {
+    const r = sheet.getLastRow();
+    sheet.getRange(r, ensureColumn_(sheet, "AuditSource")).setValue("random");
+    sheet.getRange(r, ensureColumn_(sheet, "AuditSample")).setValue(JSON.stringify(sample.picked));
+    sheet.getRange(r, ensureColumn_(sheet, "AuditSampleInfo")).setValue(sample.picked.length + " of " + sample.total + " item lines" + (sample.remarks.length ? " · " + sample.remarks.length + (sample.boxTotal ? " of " + sample.boxTotal : "") + " boxes (whole boxes recounted): " + sample.remarks.join(", ") : ""));
+  }
+  mirrorStatusRow_(sheet, sheet.getLastRow());
+  return { complete: true, audit: auditFlag };
+}
+
+// Net quantity per item line for a rack (accepted scans only; removals are
+// negative rows, so they net out). Lines that net to zero or less are ignored.
+function rackItemLines_(ss, brand, rack, countsRows) {
+  const lines = {};
+  (countsRows || sheetToObjects_(ss.getSheetByName("Counts"))).forEach((r) => {
+    if (r.Rack !== rack) return;
+    if ((r.RackBrand || r.Brand) !== brand && r.Brand !== brand) return;
+    if (r.Status === "pending" || r.Status === "rejected") return;
+    const key = itemKey_(r);
+    if (!lines[key]) lines[key] = { key: key, gtin: String(r.GTIN || ""), article: String(r.Article || ""), desc: String(r.Description || ""), color: String(r.Color || ""), size: String(r.Size || ""), qty: 0, remarks: [] };
+    const q = parseFloat(r.Qty) || 0;
+    lines[key].qty += q;
+    // Remark(s) this item was originally counted under (only rows that ADD it).
+    const remark = String(r.Remark || "").trim();
+    if (q > 0 && lines[key].remarks.indexOf(remark) === -1) lines[key].remarks.push(remark);
+  });
+  return Object.keys(lines).map((k) => lines[k]).filter((l) => l.qty > 0);
+}
+
+function itemKey_(r) {
+  const gtin = String(r.GTIN || r.gtin || "").trim();
+  if (gtin) return gtin;
+  return [r.Article || r.article || "", r.Color || r.color || "", r.Size || r.size || ""].join("|");
+}
+
+// One row per distinct item on this rack's ORIGINAL count (accepted scans
+// only — same filter handleConfirmAudit uses), qty summed across however
+// many separate submissions it was counted in, with every distinct Remark
+// those submissions carried. Backs the audit prefetch above.
+function readRackCounts_(ss, brand, rack) {
+  const sheet = getOrCreateSheet_("Counts", COUNTS_HEADERS_);
+  const rows = readRowsWhere_(sheet, "Rack", rack).filter(function (r) {
+    return r.Rack === rack && (r.RackBrand || r.Brand) === brand && r.Status !== "pending" && r.Status !== "rejected";
+  });
+  const byKey = {};
+  rows.forEach(function (r) {
+    const k = itemKey_(r);
+    const item = byKey[k] || { key: k, gtin: r.GTIN || "", article: r.Article || "", desc: r.Description || "", color: r.Color || "", size: r.Size || "", qty: 0, remarks: [] };
+    item.qty += parseFloat(r.Qty) || 0;
+    const remark = String(r.Remark || "").trim();
+    if (remark && item.remarks.indexOf(remark) === -1) item.remarks.push(remark);
+    byKey[k] = item;
+  });
+  return Object.keys(byKey).map(function (k) { return byKey[k]; });
+}
+
+// Audit sample, picked BY REMARK (box #, notes, etc.): remarks are chosen at
+// random, one after another, until the item lines under the chosen remarks
+// cover at least 25% (rounded up, min 1) of the rack's counted item lines.
+// EVERY item line under a chosen remark goes into the sample; a remark that
+// shares an item with a chosen one is pulled in as well, so the recount of each
+// item is complete. Older data that
+// has no remarks at all falls back to a random 25% of item lines.
+function pickAuditSample_(ss, brand, rack, countsRows) {
+  const lines = rackItemLines_(ss, brand, rack, countsRows);
+  const total = lines.length;
+  const out = { total: total, picked: [], length: 0, remarks: [] };
+  if (total === 0) return out;
+  const need = Math.max(1, Math.ceil(total * AUDIT_SAMPLE_RATE));
+  const shuffle = (arr) => { for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; } return arr; };
+
+  // remark -> item lines counted under it
+  const groups = {};
+  lines.forEach((l) => {
+    const rs = l.remarks.length ? l.remarks : [""];
+    rs.forEach((rm) => { (groups[rm] = groups[rm] || []).push(l); });
+  });
+  const remarkNames = Object.keys(groups);
+  const anyRemark = remarkNames.some((rm) => rm !== "");
+
+  let chosen = {};
+  if (!anyRemark) {
+    shuffle(lines.slice()).slice(0, need).forEach((l) => { chosen[l.key] = l; });
+  } else {
+    shuffle(remarkNames);
+    // key -> remarks that item was counted under (built once, so nothing below rescans everything)
+    const remarksOfKey = {};
+    remarkNames.forEach((rm) => groups[rm].forEach((l) => { (remarksOfKey[l.key] = remarksOfKey[l.key] || []).push(rm); }));
+    const pickedRemarks = {};
+    const queue = [];
+    let count = 0;
+    const needBoxes = Math.max(1, Math.ceil(remarkNames.length * AUDIT_SAMPLE_RATE));
+    const takeRemark = (rm) => {
+      // Take EVERYTHING counted under this remark.
+      pickedRemarks[rm] = true;
+      groups[rm].forEach((l) => {
+        if (!chosen[l.key]) { chosen[l.key] = l; count++; remarksOfKey[l.key].forEach((r2) => { if (!pickedRemarks[r2]) queue.push(r2); }); }
+      });
+    };
+    // WHOLE boxes only. 25% is a minimum, not a target: keep taking whole boxes until BOTH
+    // at least 25% of the item lines AND at least 25% of the boxes are covered.
+    let boxes = 0;
+    for (let i = 0; i < remarkNames.length && (count < need || boxes < needBoxes); i++) {
+      if (!pickedRemarks[remarkNames[i]]) { takeRemark(remarkNames[i]); boxes++; }
+    }
+    // The audit compares each item's TOTAL on the rack. If a chosen item was also
+    // counted under another remark, that remark is pulled in too, so every unit
+    // of a sampled item (and everything in each chosen remark) gets recounted.
+    while (queue.length) {
+      const rm = queue.pop();
+      if (!pickedRemarks[rm]) takeRemark(rm);
+    }
+    remarkNames.forEach((rm) => { if (pickedRemarks[rm]) out.remarks.push(rm || "(no remark)"); });
+    out.boxTotal = remarkNames.length;
+  }
+  // Deliberately NOT storing the original qty — the auditor must not see it.
+  out.picked = Object.keys(chosen).map((k) => { const l = chosen[k]; return { key: l.key, gtin: l.gtin, article: l.article, desc: l.desc, color: l.color, size: l.size }; });
+  out.length = out.picked.length;
+  return out;
+}
+
+function getOrCreateSheet_(name, headerRow) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+    sheet.appendRow(headerRow);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+// Converts a sheet (with a header row) into an array of plain objects.
+function sheetToObjects_(sheet) {
+  if (!sheet) return [];
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const header = values[0];
+  return values.slice(1).map((row) => {
+    const obj = {};
+    header.forEach((h, i) => (obj[h] = row[i]));
+    return obj;
+  });
+}
+
+function jsonResponse_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}

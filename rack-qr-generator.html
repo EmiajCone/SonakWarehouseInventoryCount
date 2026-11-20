@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rack QR Label Generator (admin tool)</title>
+<script src="config.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  body{font-family:-apple-system,Arial,sans-serif; max-width:900px; margin:30px auto; padding:0 16px; color:#1a1a1a;}
+  h1{font-size:1.4rem;}
+  textarea{width:100%; height:160px; font-family:monospace; font-size:13px; padding:10px; box-sizing:border-box;}
+  button{padding:10px 18px; font-size:14px; cursor:pointer; margin:10px 6px 20px 0;}
+  button:disabled{opacity:.5; cursor:default;}
+  .labels{display:grid; grid-template-columns:repeat(auto-fill, minmax(160px,1fr)); gap:14px;}
+  .label{border:1px dashed #999; padding:10px; text-align:center; page-break-inside:avoid;}
+  .label .qr{display:flex; justify-content:center; margin-bottom:6px;}
+  .label .code{font-family:monospace; font-weight:bold; font-size:13px;}
+  .note{color:#666; font-size:13px;}
+  .status{font-size:13px; margin:4px 0 14px; min-height:1.2em;}
+  .status.ok{color:#166534;}
+  .status.err{color:#b91c1c;}
+  .status.loading{color:#666;}
+  @media print{
+    textarea, button, .note, .status, h1, .instructions{display:none;}
+    .labels{grid-template-columns:repeat(4, 1fr);}
+  }
+</style>
+</head>
+<body>
+
+<h1>Rack QR Label Generator</h1>
+<div class="instructions">
+  <p class="note">
+    Loads directly from your Racks Google Sheet (the same one the app itself
+    reads, via <code>racksCsvUrl</code> in <code>config.js</code>) — no manual
+    copy-pasting needed. You can still hand-edit the list below before
+    generating (e.g. to add a rack that isn't in the sheet yet, or to
+    generate just a subset) — reloading from the sheet overwrites those
+    edits, so generate/print first if you want to keep them. This page runs
+    entirely in your browser; nothing is uploaded anywhere.
+  </p>
+  <p class="note">
+    Open THIS PAGE from your live site (not a local file) before generating —
+    the labels encode a link back to <code>index.html</code> on whatever
+    domain this page is loaded from, so that scanning a printed label with a
+    phone's own Camera app opens the counting app directly, on the right
+    rack, instead of nothing happening or opening the wrong page.
+  </p>
+  <p class="status" id="loadStatus"></p>
+  <textarea id="input" placeholder="ASICS,R01&#10;ASICS,R02&#10;ONITSUKA,R01&#10;SESM,R01"></textarea>
+  <br>
+  <button id="reloadBtn">🔄 Reload from Racks Sheet</button>
+  <button id="genBtn">Generate Labels</button>
+  <button id="printBtn">Print</button>
+  <label style="font-size:13px; margin-left:6px;"><input type="checkbox" id="plainTextMode"> Plain-text labels (old format — use if link-style labels misbehave on your phones)</label>
+</div>
+
+<div class="labels" id="labels"></div>
+
+<script>
+// Same CSV parsing + Brand-column resolution as the counting app's own
+// fetchRacks()/resolveBrandCode() in app.js, kept in sync deliberately: the
+// QR payload's brand segment must exactly match a brand `code` in
+// config.js (case-sensitive), or scanning the printed label won't auto-set
+// the brand in the counting app. A raw sheet value like "Onitsuka Tiger" is
+// resolved to its canonical code ("ONITSUKA") here for that reason — it's
+// never passed through as-is.
+function parseCSV(text) {
+  const rows = [];
+  let row = [], field = "", inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQuotes = false; }
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ",") { row.push(field); field = ""; }
+    else if (c === "\n") { row.push(field); rows.push(row); row = []; field = ""; }
+    else if (c === "\r") { /* skip */ }
+    else field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+function findCol(header, names) {
+  for (const n of names) { const i = header.indexOf(n); if (i >= 0) return i; }
+  return -1;
+}
+function resolveBrandCode(rawBrand) {
+  const raw = String(rawBrand || "").trim();
+  const rawUpper = raw.toUpperCase();
+  const brands = (window.APP_CONFIG && window.APP_CONFIG.brands) || [];
+  const match = brands.find((b) => b.code.toUpperCase() === rawUpper || b.name.toUpperCase() === rawUpper);
+  return match ? match.code : raw;
+}
+
+async function loadRacksFromSheet() {
+  const statusEl = document.getElementById("loadStatus");
+  const url = window.APP_CONFIG && window.APP_CONFIG.racksCsvUrl;
+  if (!url) {
+    statusEl.textContent = "⚠️ No racksCsvUrl set in config.js — paste rows manually below.";
+    statusEl.className = "status err";
+    return;
+  }
+  statusEl.textContent = "Loading racks from your Racks Sheet…";
+  statusEl.className = "status loading";
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const rows = parseCSV(await res.text());
+    if (rows.length < 2) throw new Error("Sheet looks empty");
+    const header = rows[0].map((h) => h.trim().toLowerCase());
+    const brandIdx = findCol(header, ["brand"]);
+    const rackIdx = findCol(header, ["rack id", "rack", "rackid"]);
+    if (brandIdx < 0 || rackIdx < 0) throw new Error('Sheet needs "Brand" and "Rack ID" columns');
+    const lines = [];
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i];
+      if (!r || !r.length) continue;
+      const brand = resolveBrandCode(r[brandIdx]);
+      const rack = String(r[rackIdx] || "").trim();
+      if (!brand || !rack) continue;
+      lines.push(brand + "," + rack);
+    }
+    if (!lines.length) throw new Error("No valid Brand/Rack ID rows found");
+    document.getElementById("input").value = lines.join("\n");
+    statusEl.textContent = `✅ Loaded ${lines.length} rack${lines.length === 1 ? "" : "s"} from the sheet.`;
+    statusEl.className = "status ok";
+    document.getElementById("genBtn").click();
+  } catch (e) {
+    statusEl.textContent = "⚠️ Couldn't load racks from the sheet (" + e.message + ") — paste rows manually below instead.";
+    statusEl.className = "status err";
+  }
+}
+
+document.getElementById("genBtn").onclick = () => {
+  const lines = document.getElementById("input").value.split("\n").map(l => l.trim()).filter(Boolean);
+  const wrap = document.getElementById("labels");
+  wrap.innerHTML = "";
+  lines.forEach(line => {
+    const [brand, rack] = line.split(",").map(s => (s || "").trim());
+    if (!brand || !rack) return;
+    // A full URL (not just the raw "WHC|BRAND|RACK" text) so scanning the
+    // printed label with the phone's OWN Camera app — not the in-app
+    // scanner — opens the counting app directly on this rack, instead of
+    // doing nothing (plain text) or opening whatever page happened to be
+    // open. Built from wherever THIS generator page is hosted, so it always
+    // points at the real index.html next to it — no config or typing a
+    // domain needed.
+    const plainText = document.getElementById("plainTextMode").checked;
+    // Works whether this page is opened as /rack-qr-generator or
+    // /rack-qr-generator.html (Vercel serves both). The old regex only matched
+    // the ".html" form, so on the extensionless URL the label pointed back at
+    // THIS generator page instead of the counting app.
+    const base = new URL("index.html", location.href).href;
+    const payload = (!plainText && base.startsWith("http")) ? `${base}?rack=${encodeURIComponent(`WHC|${brand}|${rack}`)}` : `WHC|${brand}|${rack}`;
+    const label = document.createElement("div");
+    label.className = "label";
+    const qrDiv = document.createElement("div");
+    qrDiv.className = "qr";
+    label.appendChild(qrDiv);
+    const codeDiv = document.createElement("div");
+    codeDiv.className = "code";
+    codeDiv.textContent = `${brand} — ${rack}`;
+    label.appendChild(codeDiv);
+    wrap.appendChild(label);
+    new QRCode(qrDiv, { text: payload, width: 120, height: 120 });
+  });
+};
+document.getElementById("printBtn").onclick = () => window.print();
+document.getElementById("reloadBtn").onclick = loadRacksFromSheet;
+
+loadRacksFromSheet(); // auto-load on page open; falls back to an empty box (with an explanation above) if it fails
+</script>
+
+</body>
+</html>
